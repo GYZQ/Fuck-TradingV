@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>My Personal TV Terminal - 秒级实时看盘</title>
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: #131722;
+      color: #d1d4dc;
+      font-family: -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, Ubuntu, sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    /* 顶部 TV 风格工具栏 */
+    .topbar {
+      height: 44px;
+      background-color: #1e222d;
+      border-bottom: 1px solid #2a2e39;
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      gap: 16px;
+      font-size: 13px;
+    }
+    .symbol-group, .tf-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .divider {
+      width: 1px;
+      height: 20px;
+      background-color: #2a2e39;
+    }
+    button {
+      background: transparent;
+      border: none;
+      color: #b2b5be;
+      padding: 5px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      transition: all 0.15s;
+    }
+    button:hover { background-color: #2a2e39; color: #ffffff; }
+    button.active { background-color: #2962ff; color: #ffffff; }
+    .live-badge {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-variant-numeric: tabular-nums;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: #089981;
+      box-shadow: 0 0 6px #089981;
+    }
+    .price-display {
+      font-size: 15px;
+      font-weight: 700;
+      color: #ffffff;
+    }
+    /* 图表容器与左上角图例 */
+    .chart-wrapper {
+      position: relative;
+      flex: 1;
+      width: 100%;
+    }
+    #tv-chart {
+      width: 100%;
+      height: 100%;
+    }
+    .legend {
+      position: absolute;
+      top: 12px;
+      left: 16px;
+      z-index: 10;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 12px;
+      background: rgba(19, 23, 34, 0.75);
+      padding: 6px 10px;
+      border-radius: 4px;
+    }
+    .legend-row { display: flex; gap: 14px; align-items: center; }
+    .ema-val { color: #00e676; font-weight: 600; }
+    .sma-val { color: #ff5252; font-weight: 600; }
+  </style>
+</head>
+<body>
+
+  <div class="topbar">
+    <div class="symbol-group" id="symbols">
+      <button class="active" data-sym="BTCUSDT">BTC/USDT</button>
+      <button data-sym="ETHUSDT">ETH/USDT</button>
+      <button data-sym="SOLUSDT">SOL/USDT</button>
+      <button data-sym="XRPUSDT">XRP/USDT</button>
+    </div>
+    <div class="divider"></div>
+    <div class="tf-group" id="timeframes">
+      <button data-tf="1m">1m</button>
+      <button data-tf="15m">15m</button>
+      <button data-tf="1h">1h</button>
+      <button data-tf="4h">4h</button>
+      <button class="active" data-tf="1d">1D</button>
+      <button data-tf="1w">1W</button>
+    </div>
+    <div class="live-badge">
+      <span class="dot" id="ws-dot"></span>
+      <span id="ws-status">实时连接中</span>
+      <span class="price-display" id="live-price">--</span>
+    </div>
+  </div>
+
+  <div class="chart-wrapper">
+    <div class="legend">
+      <div class="legend-row">
+        <strong id="legend-title" style="color:#fff; font-size:14px;">BTCUSDT · 1D</strong>
+        <span id="ohlc-info" style="color:#b2b5be;"></span>
+      </div>
+      <div class="legend-row">
+        <span>Pi Cycle Bottom (锁定日线):</span>
+        <span class="ema-val" id="legend-ema">150D EMA: --</span>
+        <span class="sma-val" id="legend-sma">471D SMA×0.745: --</span>
+      </div>
+    </div>
+    <div id="tv-chart"></div>
+  </div>
+
+  <script>
+    let currentSymbol = 'BTCUSDT';
+    let currentInterval = '1d';
+    let ws = null;
+    let dailyCloses = []; // 存储日线收盘价用于精确计算 Pi Cycle Bottom
+
+    // 初始化 TV 图表
+    const chartContainer = document.getElementById('tv-chart');
+    const chart = LightweightCharts.createChart(chartContainer, {
+      layout: {
+        background: { type: 'solid', color: '#131722' },
+        textColor: '#d1d4dc',
+      },
+      grid: {
+        vertLines: { color: '#1e222d' },
+        horzLines: { color: '#1e222d' },
+      },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      rightPriceScale: { borderColor: '#2a2e39', autoScale: true },
+      timeScale: { borderColor: '#2a2e39', timeVisible: true, secondsVisible: false },
+    });
+
+    const candleSeries = chart.addCandlestickSeries({
+      upColor: '#089981', downColor: '#f23645',
+      borderVisible: false, wickUpColor: '#089981', wickDownColor: '#f23645',
+    });
+
+    const emaSeries = chart.addLineSeries({ color: '#00e676', lineWidth: 2, title: '150D EMA' });
+    const smaSeries = chart.addLineSeries({ color: '#ff5252', lineWidth: 2, title: '471D SMA*0.745' });
+
+    // 自适应窗口缩放
+    window.addEventListener('resize', () => {
+      chart.applyOptions({ width: chartContainer.clientWidth, height: chartContainer.clientHeight });
+    });
+
+    // 计算日线级别的 150 EMA 和 471 SMA * 0.745
+    function calcPiCycleMap(dailyBars) {
+      const emaMap = new Map();
+      const smaMap = new Map();
+      const k = 2 / (150 + 1);
+      let prevEma = null;
+
+      for (let i = 0; i < dailyBars.length; i++) {
+        const dayKey = Math.floor(dailyBars[i].time / 86400) * 86400;
+        const c = dailyBars[i].close;
+
+        // 150 EMA
+        prevEma = prevEma === null ? c : c * k + prevEma * (1 - k);
+        emaMap.set(dayKey, prevEma);
+
+        // 471 SMA * 0.745
+        if (i >= 470) {
+          let sum = 0;
+          for (let j = i - 470; j <= i; j++) sum += dailyBars[j].close;
+          smaMap.set(dayKey, (sum / 471) * 0.745);
+        }
+      }
+      return { emaMap, smaMap };
+    }
+
+    // 加载历史 K 线并开启秒级 WebSocket 推送
+    async function loadChart(symbol, interval) {
+      if (ws) { ws.close(); ws = null; }
+      document.getElementById('legend-title').textContent = `${symbol} · ${interval.toUpperCase()}`;
+      document.getElementById('ws-status').textContent = '连接中...';
+
+      // 1. 拉取最近 1000 根日线数据（确保 471 SMA 跨周期可用）
+      const dailyRes = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1d&limit=1000`);
+      const dailyRaw = await dailyRes.json();
+      dailyCloses = dailyRaw.map(d => ({
+        time: Math.floor(d[0] / 1000),
+        close: parseFloat(d[4]),
+      }));
+      const { emaMap, smaMap } = calcPiCycleMap(dailyCloses);
+
+      // 2. 拉取当前选定周期的 K 线
+      const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=600`);
+      const raw = await res.json();
+
+      const candles = [];
+      const emaData = [];
+      const smaData = [];
+
+      raw.forEach(d => {
+        const t = Math.floor(d[0] / 1000);
+        const dayKey = Math.floor(t / 86400) * 86400;
+        candles.push({
+          time: t,
+          open: parseFloat(d[1]),
+          high: parseFloat(d[2]),
+          low: parseFloat(d[3]),
+          close: parseFloat(d[4]),
+        });
+        if (emaMap.has(dayKey)) emaData.push({ time: t, value: emaMap.get(dayKey) });
+        if (smaMap.has(dayKey)) smaData.push({ time: t, value: smaMap.get(dayKey) });
+      });
+
+      candleSeries.setData(candles);
+      emaSeries.setData(emaData);
+      smaSeries.setData(smaData);
+
+      // 更新顶部图例最新指标值
+      const lastEma = emaData[emaData.length - 1]?.value;
+      const lastSma = smaData[smaData.length - 1]?.value;
+      if (lastEma) document.getElementById('legend-ema').textContent = `150D EMA: ${lastEma.toFixed(2)}`;
+      if (lastSma) document.getElementById('legend-sma').textContent = `471D SMA×0.745: ${lastSma.toFixed(2)}`;
+
+      // 3. 建立秒级实时 WebSocket 流
+      ws = new WebSocket(`wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${interval}`);
+      ws.onopen = () => {
+        document.getElementById('ws-status').textContent = '秒级实时';
+        document.getElementById('ws-dot').style.backgroundColor = '#089981';
+      };
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        const k = msg.k;
+        const closePrice = parseFloat(k.c);
+        const bar = {
+          time: Math.floor(k.t / 1000),
+          open: parseFloat(k.o),
+          high: parseFloat(k.h),
+          low: parseFloat(k.l),
+          close: closePrice,
+        };
+        candleSeries.update(bar);
+        document.getElementById('live-price').textContent = closePrice.toLocaleString('en-US', { minimumFractionDigits: 2 });
+
+        // 实时重算当日最新 Pi Cycle 指标值
+        if (dailyCloses.length > 0) {
+          dailyCloses[dailyCloses.length - 1].close = closePrice;
+          const updated = calcPiCycleMap(dailyCloses);
+          const todayKey = Math.floor(bar.time / 86400) * 86400;
+          if (updated.emaMap.has(todayKey)) {
+            const newEma = updated.emaMap.get(todayKey);
+            emaSeries.update({ time: bar.time, value: newEma });
+            document.getElementById('legend-ema').textContent = `150D EMA: ${newEma.toFixed(2)}`;
+          }
+          if (updated.smaMap.has(todayKey)) {
+            const newSma = updated.smaMap.get(todayKey);
+            smaSeries.update({ time: bar.time, value: newSma });
+            document.getElementById('legend-sma').textContent = `471D SMA×0.745: ${newSma.toFixed(2)}`;
+          }
+        }
+      };
+      ws.onclose = () => {
+        document.getElementById('ws-status').textContent = '已断开';
+        document.getElementById('ws-dot').style.backgroundColor = '#f23645';
+      };
+    }
+
+    // 绑定顶部按钮切换事件
+    document.getElementById('symbols').addEventListener('click', (e) => {
+      if (e.target.tagName !== 'BUTTON') return;
+      document.querySelectorAll('#symbols button').forEach(b => b.classList.remove('active'));
+      e.target.classList.add('active');
+      currentSymbol = e.target.dataset.sym;
+      loadChart(currentSymbol, currentInterval);
+    });
+
+    document.getElementById('timeframes').addEventListener('click', (e) => {
+      if (e.target.tagName !== 'BUTTON') return;
+      document.querySelectorAll('#timeframes button').forEach(b => b.classList.remove('active'));
+      e.target.classList.add('active');
+      currentInterval = e.target.dataset.tf;
+      loadChart(currentSymbol, currentInterval);
+    });
+
+    // 启动默认加载
+    loadChart(currentSymbol, currentInterval);
+  </script>
+</body>
+</html>
